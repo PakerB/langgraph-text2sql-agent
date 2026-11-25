@@ -1,0 +1,20 @@
+# Secrets
+.env
+
+# BIRD data (download with `python -m text2sql_agent.download_data`)
+data/
+
+# Generated artifacts
+schemas/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

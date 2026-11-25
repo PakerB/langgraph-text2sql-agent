@@ -1,0 +1,3 @@
+langgraph==1.2.11
+langchain-core==1.8.4
+langchain-google-genai==4.5.2
