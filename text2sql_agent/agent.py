@@ -4,7 +4,12 @@ START -> prepare_prompt -> agent <-> tools -> check_final_sql -> (revise: agent)
 
 prepare_prompt, check_final_sql and submit are fixed workflow steps; the agent node decides
 whether, what and how often to explore the database with run_sql.
+
+v2 runs this graph once per reasoning strategy (STRATEGIES below) and picks one answer with
+select_unit_tests.py. Without a strategy the graph is the v1 agent.
 """
+import json
+import re
 from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -35,11 +40,61 @@ Common SQL pitfalls to check before your final answer:
 - If the evidence gives a formula, compute it as given instead of using a similar-looking stored column."""
 
 
-def build_prompt(q: dict, pitfalls: bool = False) -> str:
+# ---------- v2 reasoning strategies ----------
+# What the model must write before the SQL. All wording is generic: no table, column or question content.
+GRAIN_NOTES = """
+- Start your first reply with a short "Notes:" section (at most 5 lines): what one row of the answer represents; what is counted, summed or averaged and at which grain (e.g. people, cards, single items, distinct orders); which columns hold it; and whether one stored row or cell is exactly one such unit (a cell may hold a list of several items, a table may repeat the same entity). Then use run_sql to check what you are unsure about."""
+
+DECOMPOSE = """
+- Start your first reply with a short "Sub-questions:" section: break the question into the smaller questions it depends on (e.g. which rows qualify, what is computed for them, how results are combined), each with a short SQL draft. Use run_sql to check the sub-queries you are unsure about, then combine them into one final query and check that its result agrees with the sub-results.
+- Output columns: return exactly the values the question asks for, one column per requested value, in the order asked. Add no extra columns (no helper counts, ids, or values used only for sorting or filtering) and leave none out. If the question asks "how many", return the count, not the list."""
+
+# Each strategy is exactly the configuration that was measured on the development set.
+# `direct` has no list-column annotation: it was measured before the annotation existed and is kept as measured.
+STRATEGIES = {
+    "direct": {"pitfalls": True, "list_cols": False, "reasoning": ""},
+    "grain": {"pitfalls": True, "list_cols": True, "reasoning": GRAIN_NOTES},
+    "decompose": {"pitfalls": True, "list_cols": True, "reasoning": DECOMPOSE},
+}
+
+
+# ---------- List-column annotation ----------
+LIST_COLUMNS_FILE = RICH_SCHEMA_DIR / "list_columns.json"   # written once by list_columns.py
+_list_cols = None
+
+
+def annotate_list_columns(schema: str, db_id: str) -> str:
+    """Append a value-format note to the schema line of every column that list_columns.py classified as a list."""
+    global _list_cols
+    if _list_cols is None:
+        if not LIST_COLUMNS_FILE.exists():
+            raise SystemExit(f"{LIST_COLUMNS_FILE} not found. Run: python -m text2sql_agent.list_columns")
+        _list_cols = json.loads(LIST_COLUMNS_FILE.read_text(encoding="utf-8"))
+    tags = {k: v for k, v in _list_cols.get(db_id, {}).items() if v["is_list"]}
+    if not tags:
+        return schema
+    out, table = [], None
+    for line in schema.split("\n"):
+        m = re.match(r"CREATE TABLE `(.+)` \(", line)
+        if m:
+            table = m.group(1)
+        m = re.match(r"    `(.+?)` ", line)
+        if m and f"{table}.{m.group(1)}" in tags:
+            t = tags[f"{table}.{m.group(1)}"]
+            line += (f"; value format: a cell may hold a list of several items separated by {t['separator']!r}, "
+                     f"with or without a space after it (e.g. {t['example'][0]!r}); to count or match single items, "
+                     f"split the cell and trim each item")
+        out.append(line)
+    return "\n".join(out)
+
+
+def build_prompt(q: dict, pitfalls: bool = False, list_cols: bool = False, reasoning: str = "") -> str:
     """Official BIRD prompt with the enriched schema and the extra instructions."""
     schema = (RICH_SCHEMA_DIR / f"{q['db_id']}.txt").read_text(encoding="utf-8")
+    if list_cols:
+        schema = annotate_list_columns(schema, q["db_id"])
     prompt = fill_template(schema, official_question_block(q))
-    extra = EXTRA_INSTRUCTIONS + (PITFALLS if pitfalls else "")
+    extra = EXTRA_INSTRUCTIONS + reasoning + (PITFALLS if pitfalls else "")
     return prompt.replace("\n\nOutput Format:", extra + "\n\nOutput Format:", 1)
 
 
@@ -60,11 +115,13 @@ class State(MessagesState):
     final_sql: Optional[str]
 
 
-def make_graph(llm, pitfalls: bool = False):
+def make_graph(llm, pitfalls: bool = False, strategy: Optional[str] = None):
+    """v1 agent (optionally with the pitfalls checklist), or one v2 strategy (which sets everything itself)."""
+    cfg = STRATEGIES[strategy] if strategy else {"pitfalls": pitfalls, "list_cols": False, "reasoning": ""}
     llm_with_tools = llm.bind_tools([run_sql])
 
     def prepare_prompt(state: State):
-        return {"messages": [HumanMessage(build_prompt(state["question"], pitfalls))],
+        return {"messages": [HumanMessage(build_prompt(state["question"], **cfg))],
                 "tool_calls_used": 0, "revisions": 0, "last_checked_sql": None, "final_sql": None}
 
     def agent(state: State):
