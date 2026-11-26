@@ -149,12 +149,31 @@ def invoke_with_retry(llm, messages, tries: int = 6, wait_s: float = 20):
             time.sleep(wait_s * (i + 1))
 
 
-def make_llm(model: str):
-    """Gemini via langchain-google-genai.
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
-    The native client is required for tool calling: Gemini returns a thought signature
-    with each function call that must be sent back on the next turn.
+
+def make_llm(model: str, thinking: bool = False):
+    """Create the chat model from its name.
+
+    - "deepseek-*": OpenAI-compatible API, non-thinking mode by default. Thinking mode cannot be used
+      with tool calls here: the API then requires the previous turns' reasoning_content to be sent back,
+      which langchain-openai drops. thinking=True is used only for single calls without tools
+      (the thinking baseline and the unit-test selector). No per-minute limit, so no rate limiter.
+    - otherwise Gemini via langchain-google-genai. The native client is required for tool calling:
+      Gemini returns a thought signature with each function call that must be sent back on the next turn.
     """
+    if model.startswith("deepseek"):
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            api_key=load_env_key("DEEPSEEK_API_KEY"),
+            base_url=DEEPSEEK_BASE_URL,
+            temperature=0,
+            max_retries=2,
+            timeout=300 if thinking else 120,
+            extra_body={"thinking": {"type": "enabled" if thinking else "disabled"}},
+        )
+
     from langchain_core.rate_limiters import InMemoryRateLimiter
     from langchain_google_genai import ChatGoogleGenerativeAI
 
